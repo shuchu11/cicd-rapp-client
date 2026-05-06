@@ -1,0 +1,23 @@
+[
+  {
+    "bitrate": 600,
+    "total_threads": 9,
+    "active_threads": 9,
+    "ptp_offset_ns": null,
+    "iperf_result": null
+  },
+  {
+    "bitrate": 700,
+    "total_threads": 15,
+    "active_threads": 15,
+    "ptp_offset_ns": null,
+    "iperf_result": null
+  },
+  {
+    "bitrate": 800,
+    "total_threads": 11,
+    "active_threads": 11,
+    "ptp_offset_ns": null,
+    "iperf_result": null
+  }
+]

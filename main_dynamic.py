@@ -14,6 +14,7 @@ INSTANCE_ID = "be0cc18b-1b8e-4b58-a2bc-9f4681ac6142"
 IPERF_BITRATE = 200  # Mbps
 IPERF_DURATION = 10
 PERF_DURATION = 15
+PTP_INTERFACE = "eth0"  # PTP interface name
 
 # --- TEST MATRIX CONFIGURATION ---
 RUNS_PER_CASE = 1
@@ -29,7 +30,6 @@ VENDORS = [
 TEST_SCENARIOS = []
 for vendor in VENDORS:
     for cpu_count in CPU_VARIANTS:
-        # Test ID format: PEG-CPU-8
         test_id = f"{vendor['id_prefix']}-CPU-{cpu_count}"
         TEST_SCENARIOS.append({
             "test_id": test_id,
@@ -53,6 +53,7 @@ for vendor in VENDORS:
             }
         })
 
+
 def build_gnb_config(scenario):
     safe_name = f"oai-gnb-{scenario['test_id'].lower().replace('_', '-')}"
     return {
@@ -65,6 +66,7 @@ def build_gnb_config(scenario):
         "target_cluster": "cc1397ba-b1c4-4a3e-bc8d-6af58ef53818",
         "values": scenario['custom_values']
     }
+
 
 def deploy_gnb(config):
     print(f"  Deploying {config['name']}...")
@@ -82,6 +84,7 @@ def deploy_gnb(config):
         print(f"    ✗ Deploy error: {e}")
         return None
 
+
 def terminate_gnb(deployment_id):
     print(f"  Terminating gNB {deployment_id}...")
     try:
@@ -93,6 +96,7 @@ def terminate_gnb(deployment_id):
     except Exception as e:
         print(f"    ✗ Terminate error: {e}")
         return False
+
 
 def check_ue_status():
     try:
@@ -106,24 +110,28 @@ def check_ue_status():
     except:
         return False, None
 
+
 def get_ptp_status():
+    """Fetch PTP offset via rAPP proxy"""
     try:
-        resp = requests.get(f"{RAPP_URL}/sideload/{INSTANCE_ID}/ptp_status", timeout=10)
+        resp = requests.post(
+            f"{RAPP_URL}/sideload/measure/ptp",
+            json={
+                "instance_id": INSTANCE_ID,
+                "duration": 5,
+                "interface": PTP_INTERFACE,
+                "include_timeseries": False,
+            },
+            timeout=15,
+        )
         if resp.status_code == 200:
-            return abs(float(resp.json().get('ptp_offset', '0')))
+            data = resp.json()
+            offset = data.get("offset_ns") or data.get("mean_offset_ns") or 0
+            return abs(float(offset))
         return None
     except:
         return None
 
-def check_fh_connection():
-    try:
-        resp = requests.get(f"{RAPP_URL}/gnb/logs", timeout=10)
-        if resp.status_code == 200:
-            logs = resp.text
-            return "FH connection established" in logs or "O-RU connected" in logs
-        return None
-    except:
-        return None
 
 def toggle_airplane_mode():
     try:
@@ -134,9 +142,14 @@ def toggle_airplane_mode():
     except:
         pass
 
+
 def run_iperf_test():
     try:
-        resp = requests.post(f"{RAPP_URL}/ue/iperf", json={"duration": IPERF_DURATION, "bitrate": IPERF_BITRATE}, timeout=IPERF_DURATION + 20)
+        resp = requests.post(
+            f"{RAPP_URL}/ue/iperf",
+            json={"duration": IPERF_DURATION, "bitrate": IPERF_BITRATE},
+            timeout=IPERF_DURATION + 20,
+        )
         if resp.status_code == 200:
             data = resp.json()
             stream = data.get('end', {}).get('streams', [{}])[0].get('udp', {})
@@ -149,15 +162,27 @@ def run_iperf_test():
     except:
         return None
 
+
 def fetch_thread_cpu():
+    """Fetch thread CPU data via rAPP proxy"""
     print("  Fetching thread CPU data...")
     try:
-        resp = requests.post(f"{RAPP_URL}/sideload/measure/thread_cpu", json={"instance_id": INSTANCE_ID, "duration": PERF_DURATION, "pgrep": "softmodem"}, timeout=PERF_DURATION + 10)
+        resp = requests.post(
+            f"{RAPP_URL}/sideload/measure/thread_cpu",
+            json={
+                "instance_id": INSTANCE_ID,
+                "duration": PERF_DURATION,
+                "pgrep": "softmodem",
+                "include_timeseries": True,
+            },
+            timeout=PERF_DURATION + 10,
+        )
         if resp.status_code == 200:
             return resp.json()
         return None
     except:
         return None
+
 
 def generate_plots(data, test_label, timestamp, iperf_result, ue_status):
     try:
@@ -176,6 +201,7 @@ def generate_plots(data, test_label, timestamp, iperf_result, ue_status):
         plt.close()
     except Exception as e:
         print(f"  ! Plot error: {e}")
+
 
 def run_single_test(scenario, run_number, timestamp):
     print(f"\n  Run #{run_number + 1}/{scenario['runs']}")
@@ -221,14 +247,12 @@ def run_single_test(scenario, run_number, timestamp):
             'jitter_ms': 0.0,
             'lost_percent': 0.0,
             'ptp_rms_ns': get_ptp_status(),
-            'fh_connected': check_fh_connection(),
             'ue_rsrp': None,
             'ue_rsrq': None,
             'ue_sinr': None,
             'cpu_data': None
         }
 
-    # Safe extraction (handles cases where signal might be None despite logic)
     rsrp = signal.get('rsrp') if signal else None
     rsrq = signal.get('rsrq') if signal else None
     sinr = signal.get('sinr') if signal else None
@@ -251,12 +275,12 @@ def run_single_test(scenario, run_number, timestamp):
         'jitter_ms': iperf_result['jitter_ms'] if iperf_result else 0.0,
         'lost_percent': iperf_result['lost_percent'] if iperf_result else 0.0,
         'ptp_rms_ns': get_ptp_status(),
-        'fh_connected': check_fh_connection(),
         'ue_rsrp': rsrp,
         'ue_rsrq': rsrq,
         'ue_sinr': sinr,
         'cpu_data': cpu_data
     }
+
 
 def run_test_scenario(scenario, timestamp):
     print(f"\n{'='*70}")
@@ -267,7 +291,8 @@ def run_test_scenario(scenario, timestamp):
     gnb_config = build_gnb_config(scenario)
     deployment_id = deploy_gnb(gnb_config)
 
-    if not deployment_id: return {'test_id': scenario['test_id'], 'successful_runs': 0}
+    if not deployment_id:
+        return {'test_id': scenario['test_id'], 'successful_runs': 0}
 
     print("  Waiting 30s for stabilization...")
     time.sleep(30)
@@ -276,7 +301,8 @@ def run_test_scenario(scenario, timestamp):
     try:
         for run_num in range(scenario['runs']):
             run_results.append(run_single_test(scenario, run_num, timestamp))
-            if run_num < scenario['runs'] - 1: time.sleep(3)
+            if run_num < scenario['runs'] - 1:
+                time.sleep(3)
     finally:
         terminate_gnb(deployment_id)
 
@@ -307,9 +333,11 @@ def run_test_scenario(scenario, timestamp):
 
     return stats
 
+
 def generate_summary_report(all_results, timestamp):
     valid_results = [r for r in all_results if r and 'test_id' in r]
-    if not valid_results: return
+    if not valid_results:
+        return
 
     # --- Prepare CPU Stacked Data ---
     cpu_breakdown = {}
@@ -350,7 +378,7 @@ def generate_summary_report(all_results, timestamp):
             colors.append('gray')
 
     def simple_bar(ax, data, title, ylabel):
-        bars = ax.bar(test_ids, data, color=colors, alpha=0.7)
+        ax.bar(test_ids, data, color=colors, alpha=0.7)
         ax.set_title(title, fontweight='bold', fontsize=10)
         ax.set_ylabel(ylabel, fontsize=9)
         ax.tick_params(axis='x', rotation=45, labelsize=8)
@@ -358,25 +386,15 @@ def generate_summary_report(all_results, timestamp):
 
     # ROW 1: Network Performance
     simple_bar(fig.add_subplot(gs[0, 0]), [r.get('avg_throughput_mbps', 0) for r in valid_results], 'DL Throughput', 'Mbps')
+    simple_bar(fig.add_subplot(gs[0, 1]), [r.get('avg_jitter_ms', 0) or 0 for r in valid_results], 'Average Jitter', 'ms')
+    simple_bar(fig.add_subplot(gs[0, 2]), [r.get('avg_loss_percent', 0) or 0 for r in valid_results], 'Packet Loss', '%')
 
-    jitter_data = [r.get('avg_jitter_ms', 0) if r.get('avg_jitter_ms') is not None else 0 for r in valid_results]
-    simple_bar(fig.add_subplot(gs[0, 1]), jitter_data, 'Average Jitter', 'ms')
-
-    loss_data = [r.get('avg_loss_percent', 0) if r.get('avg_loss_percent') is not None else 0 for r in valid_results]
-    simple_bar(fig.add_subplot(gs[0, 2]), loss_data, 'Packet Loss', '%')
-
-    # ROW 2: Signal Quality (Restored RSRQ/SINR)
-    rsrp_data = [r.get('avg_rsrp_dbm', 0) if r.get('avg_rsrp_dbm') is not None else 0 for r in valid_results]
-    simple_bar(fig.add_subplot(gs[1, 0]), rsrp_data, 'RSRP', 'dBm')
-
-    rsrq_data = [r.get('avg_rsrq_db', 0) if r.get('avg_rsrq_db') is not None else 0 for r in valid_results]
-    simple_bar(fig.add_subplot(gs[1, 1]), rsrq_data, 'RSRQ', 'dB')
-
-    sinr_data = [r.get('avg_sinr_db', 0) if r.get('avg_sinr_db') is not None else 0 for r in valid_results]
-    simple_bar(fig.add_subplot(gs[1, 2]), sinr_data, 'SINR', 'dB')
+    # ROW 2: Signal Quality
+    simple_bar(fig.add_subplot(gs[1, 0]), [r.get('avg_rsrp_dbm', 0) or 0 for r in valid_results], 'RSRP', 'dBm')
+    simple_bar(fig.add_subplot(gs[1, 1]), [r.get('avg_rsrq_db', 0) or 0 for r in valid_results], 'RSRQ', 'dB')
+    simple_bar(fig.add_subplot(gs[1, 2]), [r.get('avg_sinr_db', 0) or 0 for r in valid_results], 'SINR', 'dB')
 
     # ROW 3: CPU Stack & Table
-    # Stacked CPU Chart (Spans first 2 columns)
     ax7 = fig.add_subplot(gs[2, :2])
     if not df_cpu.empty:
         df_cpu.plot(kind='bar', stacked=True, ax=ax7, colormap='tab20', width=0.6)
@@ -386,7 +404,7 @@ def generate_summary_report(all_results, timestamp):
         plt.setp(ax7.xaxis.get_majorticklabels(), rotation=0, fontsize=9)
         ax7.grid(axis='y', alpha=0.3)
 
-    # Parameter Table (Last column)
+    # Parameter Table
     ax9 = fig.add_subplot(gs[2, 2])
     ax9.axis('off')
     table_data = [[r['test_id'], r['oru'], r['isolcpus']] for r in valid_results]
@@ -396,6 +414,7 @@ def generate_summary_report(all_results, timestamp):
     plt.suptitle(f'O-RAN Resource Scaling (PEG vs LIT) - {timestamp}', fontsize=16, fontweight='bold')
     plt.savefig(f'resource_test_full_{timestamp}.png', dpi=150, bbox_inches='tight')
     print("✓ Plots generated")
+
 
 def main():
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -410,6 +429,7 @@ def main():
 
     generate_summary_report(all_results, timestamp)
     print(f"\nAll tests complete.")
+
 
 if __name__ == "__main__":
     main()
