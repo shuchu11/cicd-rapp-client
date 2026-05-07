@@ -1,32 +1,33 @@
 import json
+import re
 import pandas as pd
 import seaborn as sns
 import matplotlib.pyplot as plt
 import requests
 from datetime import datetime
 import time
+import threading
 import numpy as np
 
 # Configuration
-RAPP_URL = "http://192.168.8.35:5000"
+RAPP_URL = "http://192.168.8.69:32500"
+SIDELOADER_URL = "http://192.168.206.82:32501"
 NFO_URL = "http://192.168.8.35:8080"
-INSTANCE_ID = "be0cc18b-1b8e-4b58-a2bc-9f4681ac6142"
+INSTANCE_ID = "0fedeadc-c46b-4675-9f5e-38f3e5470bd6"
 IPERF_BITRATE = 200  # Mbps
 IPERF_DURATION = 10
-PERF_DURATION = 15
-PTP_INTERFACE = "eth0"  # PTP interface name
+PERF_DURATION = 10
+PTP_INTERFACE = "eth0"
 
 # --- TEST MATRIX CONFIGURATION ---
 RUNS_PER_CASE = 1
 CPU_VARIANTS = [8, 10, 12, 14]
 
-# Define the vendor specifics
 VENDORS = [
     {"name": "pegatron", "branch": "starlingx/pegatron", "id_prefix": "PEG"},
     {"name": "liteon",   "branch": "starlingx/liteon",   "id_prefix": "LIT"}
 ]
 
-# Generate the full matrix
 TEST_SCENARIOS = []
 for vendor in VENDORS:
     for cpu_count in CPU_VARIANTS:
@@ -39,16 +40,8 @@ for vendor in VENDORS:
             "custom_values": {
                 "resources": {
                     "define": True,
-                    "limits": {
-                        "nf": {
-                            "wr_isolcpus": cpu_count
-                        }
-                    },
-                    "requests": {
-                        "nf": {
-                            "wr_isolcpus": cpu_count
-                        }
-                    }
+                    "limits": {"nf": {"wr_isolcpus": cpu_count}},
+                    "requests": {"nf": {"wr_isolcpus": cpu_count}}
                 }
             }
         })
@@ -112,7 +105,6 @@ def check_ue_status():
 
 
 def get_ptp_status():
-    """Fetch PTP offset via rAPP proxy"""
     try:
         resp = requests.post(
             f"{RAPP_URL}/sideload/measure/ptp",
@@ -164,18 +156,17 @@ def run_iperf_test():
 
 
 def fetch_thread_cpu():
-    """Fetch thread CPU data via rAPP proxy"""
+    """Fetch thread CPU data directly from sideloader"""
     print("  Fetching thread CPU data...")
     try:
         resp = requests.post(
-            f"{RAPP_URL}/sideload/measure/thread_cpu",
+            f"{SIDELOADER_URL}/process/threads",
             json={
-                "instance_id": INSTANCE_ID,
                 "duration": PERF_DURATION,
-                "pgrep": "softmodem",
+                "pgrep": "gnb",
                 "include_timeseries": True,
             },
-            timeout=PERF_DURATION + 10,
+            timeout=PERF_DURATION + 30,
         )
         if resp.status_code == 200:
             return resp.json()
@@ -184,14 +175,109 @@ def fetch_thread_cpu():
         return None
 
 
+def fetch_cpu_monitor():
+    """Fetch per-core CPU usage timeseries directly from sideloader"""
+    print("  Fetching per-core CPU data...")
+    try:
+        resp = requests.post(
+            f"{SIDELOADER_URL}/cpu/monitor",
+            json={
+                "duration": PERF_DURATION,
+                "include_timeseries": True,
+            },
+            timeout=PERF_DURATION + 30,
+        )
+        if resp.status_code == 200:
+            return resp.json()
+        return None
+    except:
+        return None
+
+
+def _sort_cpu_keys(keys):
+    def _k(k):
+        m = re.match(r"^cpu(\d+)$", k)
+        return (0, int(m.group(1))) if m else (1, k)
+    return sorted(keys, key=_k)
+
+
+def generate_cpu_plots(cpu_data, test_label, timestamp):
+    """Generate per-core CPU heatmap and timeseries plots"""
+    if not cpu_data or "cpus" not in cpu_data:
+        print("  No per-core CPU data to plot")
+        return
+
+    cpus = cpu_data["cpus"]
+    cpu_keys = _sort_cpu_keys([k for k in cpus if re.match(r"^cpu\d+$", k)])
+
+    # --- 1. CPU Core Heatmap ---
+    stats = {
+        "min %": [cpus[k]["usage"]["min"] for k in cpu_keys],
+        "avg %": [cpus[k]["usage"]["avg"] for k in cpu_keys],
+        "max %": [cpus[k]["usage"]["max"] for k in cpu_keys],
+    }
+    df_stats = pd.DataFrame(stats, index=cpu_keys)
+
+    fig_h = max(6, len(cpu_keys) * 0.35)
+    fig, ax = plt.subplots(figsize=(8, fig_h))
+    sns.heatmap(df_stats, annot=True, fmt=".1f", cmap="YlOrRd",
+                cbar_kws={"label": "CPU %"}, ax=ax)
+    ax.set_title(f"CPU Core Usage Heatmap - {test_label}\n{timestamp}")
+    ax.set_xlabel("Metric")
+    ax.set_ylabel("CPU Core")
+    plt.tight_layout()
+    heatmap_file = f"cpu_core_heatmap_{test_label}_{timestamp}.png"
+    plt.savefig(heatmap_file, dpi=150)
+    print(f"  Saved {heatmap_file}")
+    plt.close()
+
+    # --- 2. CPU Core Timeseries ---
+    active_cores = [k for k in cpu_keys if cpus[k]["usage"]["avg"] > 1.0] or cpu_keys
+
+    timestamps = None
+    for k in active_cores:
+        ts_data = cpus[k]["usage"].get("timeseries")
+        if ts_data and "timestamps" in ts_data:
+            t0 = ts_data["timestamps"][0]
+            timestamps = [t - t0 for t in ts_data["timestamps"]]
+            break
+
+    if timestamps is None:
+        return
+
+    fig, ax = plt.subplots(figsize=(14, 6))
+    cmap = plt.get_cmap("tab20")
+    for i, cpu_key in enumerate(active_cores):
+        ts_data = cpus[cpu_key]["usage"].get("timeseries")
+        if ts_data and "percent" in ts_data:
+            ax.plot(timestamps, ts_data["percent"],
+                    label=cpu_key, color=cmap(i % 20), linewidth=1.5)
+
+    ax.set_title(f"CPU Core Usage Timeseries - {test_label}\n{timestamp}")
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("CPU Usage (%)")
+    ax.set_ylim(0, 105)
+    ax.legend(loc="upper right", fontsize=8, ncol=4)
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    timeseries_file = f"cpu_core_timeseries_{test_label}_{timestamp}.png"
+    plt.savefig(timeseries_file, dpi=150)
+    print(f"  Saved {timeseries_file}")
+    plt.close()
+
+
 def generate_plots(data, test_label, timestamp, iperf_result, ue_status):
+    """Generate thread CPU heatmap"""
     try:
         df = pd.DataFrame(data['threads'])
         df['tid_numeric'] = pd.to_numeric(df['tid'])
         df = df.sort_values('tid_numeric')
         df['label'] = df['name'] + " (TID: " + df['tid'] + ")"
         df.set_index('label', inplace=True)
-        heatmap_data = df[['min_cpu', 'avg_cpu', 'max_cpu']]
+        df["min_cpu"] = df["cpu_usage"].apply(lambda x: x["min"])
+        df["avg_cpu"] = df["cpu_usage"].apply(lambda x: x["avg"])
+        df["max_cpu"] = df["cpu_usage"].apply(lambda x: x["max"])
+        heatmap_data = df[["min_cpu", "avg_cpu", "max_cpu"]]
 
         plt.figure(figsize=(12, 8))
         sns.heatmap(heatmap_data, annot=True, cmap='YlOrRd', fmt='.1f')
@@ -209,34 +295,28 @@ def run_single_test(scenario, run_number, timestamp):
     toggle_airplane_mode()
     attached, ue_status = check_ue_status()
 
-    # --- PLMN CHECK ---
     signal = None
     if ue_status:
         cell_info = ue_status.get('cell', {})
         mcc = str(cell_info.get('mcc', ''))
         mnc = str(cell_info.get('mnc', ''))
-
         if mcc == '101' and mnc == '01':
             signal = ue_status.get('signal')
         elif attached:
             print(f"    ! WRONG PLMN DETECTED: {mcc}{mnc} (Expected 10101)")
-            signal = None
 
     if attached and signal is None:
         print("    ! Signal missing or invalid PLMN. Retrying...")
         time.sleep(5)
         _, ue_status = check_ue_status()
-
         if ue_status:
             cell_info = ue_status.get('cell', {})
             mcc = str(cell_info.get('mcc', ''))
             mnc = str(cell_info.get('mnc', ''))
-
             if mcc == '101' and mnc == '01':
                 signal = ue_status.get('signal')
             else:
                 print(f"    ! WRONG PLMN ON RETRY: {mcc}{mnc}")
-                signal = None
 
     if not attached or signal is None:
         print("    ! NO VALID SIGNAL (10101). Skipping traffic test.")
@@ -250,23 +330,48 @@ def run_single_test(scenario, run_number, timestamp):
             'ue_rsrp': None,
             'ue_rsrq': None,
             'ue_sinr': None,
-            'cpu_data': None
+            'cpu_data': None,
+            'core_cpu_data': None,
         }
 
     rsrp = signal.get('rsrp') if signal else None
     rsrq = signal.get('rsrq') if signal else None
     sinr = signal.get('sinr') if signal else None
-
     print(f"    UE (10101): RSRP={rsrp} dBm, RSRQ={rsrq} dB, SINR={sinr} dB")
 
-    iperf_result = run_iperf_test()
-    time.sleep(1)
-    cpu_data = fetch_thread_cpu()
+    # Run iperf, thread CPU, per-core CPU in parallel
+    _iperf = [None]
+    _cpu = [None]
+    _core_cpu = [None]
+
+    def _run_iperf(): _iperf[0] = run_iperf_test()
+    def _run_cpu():
+        time.sleep(1)
+        _cpu[0] = fetch_thread_cpu()
+    def _run_core_cpu():
+        time.sleep(1)
+        _core_cpu[0] = fetch_cpu_monitor()
+
+    t1 = threading.Thread(target=_run_iperf)
+    t2 = threading.Thread(target=_run_cpu)
+    t3 = threading.Thread(target=_run_core_cpu)
+    t1.start(); t2.start(); t3.start()
+    t1.join(); t2.join(); t3.join()
+
+    iperf_result = _iperf[0]
+    cpu_data = _cpu[0]
+    core_cpu_data = _core_cpu[0]
+    test_label = f"{scenario['test_id']}_R{run_number + 1}"
 
     if cpu_data:
         with open(f"{scenario['test_id']}_run{run_number + 1}_{timestamp}.json", 'w') as f:
             json.dump({'cpu': cpu_data, 'iperf': iperf_result, 'ue': ue_status}, f)
-        generate_plots(cpu_data, f"{scenario['test_id']}_R{run_number + 1}", timestamp, iperf_result, ue_status)
+        generate_plots(cpu_data, test_label, timestamp, iperf_result, ue_status)
+
+    if core_cpu_data:
+        with open(f"{scenario['test_id']}_cores_run{run_number + 1}_{timestamp}.json", 'w') as f:
+            json.dump(core_cpu_data, f, indent=2)
+        generate_cpu_plots(core_cpu_data, test_label, timestamp)
 
     return {
         'run': run_number + 1,
@@ -278,7 +383,8 @@ def run_single_test(scenario, run_number, timestamp):
         'ue_rsrp': rsrp,
         'ue_rsrq': rsrq,
         'ue_sinr': sinr,
-        'cpu_data': cpu_data
+        'cpu_data': cpu_data,
+        'core_cpu_data': core_cpu_data,
     }
 
 
@@ -339,7 +445,6 @@ def generate_summary_report(all_results, timestamp):
     if not valid_results:
         return
 
-    # --- Prepare CPU Stacked Data ---
     cpu_breakdown = {}
     for r in valid_results:
         test_id = r['test_id']
@@ -351,7 +456,8 @@ def generate_summary_report(all_results, timestamp):
                 if run.get('cpu_data') and run['cpu_data'].get('threads'):
                     run_count += 1
                     for t in run['cpu_data']['threads']:
-                        thread_totals[t['name']] = thread_totals.get(t['name'], 0) + t['avg_cpu']
+                        avg = t['cpu_usage']['avg'] if isinstance(t.get('cpu_usage'), dict) else t.get('avg_cpu', 0)
+                        thread_totals[t['name']] = thread_totals.get(t['name'], 0) + avg
             if run_count > 0:
                 for name, total in thread_totals.items():
                     cpu_breakdown[test_id][name] = total / run_count
@@ -363,19 +469,11 @@ def generate_summary_report(all_results, timestamp):
         df_cpu['Others'] = df_cpu.loc[:, ~df_cpu.columns.isin(top_threads)].sum(axis=1)
         df_cpu = df_cpu[list(top_threads) + ['Others']]
 
-    # --- Plotting (3x3 Grid) ---
     fig = plt.figure(figsize=(20, 14))
     gs = fig.add_gridspec(3, 3, hspace=0.45, wspace=0.3)
 
     test_ids = [r['test_id'] for r in valid_results]
-    colors = []
-    for tid in test_ids:
-        if "PEG" in tid:
-            colors.append('#ff7f0e')
-        elif "LIT" in tid:
-            colors.append('#1f77b4')
-        else:
-            colors.append('gray')
+    colors = ['#ff7f0e' if "PEG" in tid else '#1f77b4' if "LIT" in tid else 'gray' for tid in test_ids]
 
     def simple_bar(ax, data, title, ylabel):
         ax.bar(test_ids, data, color=colors, alpha=0.7)
@@ -384,17 +482,13 @@ def generate_summary_report(all_results, timestamp):
         ax.tick_params(axis='x', rotation=45, labelsize=8)
         ax.grid(axis='y', alpha=0.3)
 
-    # ROW 1: Network Performance
     simple_bar(fig.add_subplot(gs[0, 0]), [r.get('avg_throughput_mbps', 0) for r in valid_results], 'DL Throughput', 'Mbps')
     simple_bar(fig.add_subplot(gs[0, 1]), [r.get('avg_jitter_ms', 0) or 0 for r in valid_results], 'Average Jitter', 'ms')
     simple_bar(fig.add_subplot(gs[0, 2]), [r.get('avg_loss_percent', 0) or 0 for r in valid_results], 'Packet Loss', '%')
-
-    # ROW 2: Signal Quality
     simple_bar(fig.add_subplot(gs[1, 0]), [r.get('avg_rsrp_dbm', 0) or 0 for r in valid_results], 'RSRP', 'dBm')
     simple_bar(fig.add_subplot(gs[1, 1]), [r.get('avg_rsrq_db', 0) or 0 for r in valid_results], 'RSRQ', 'dB')
     simple_bar(fig.add_subplot(gs[1, 2]), [r.get('avg_sinr_db', 0) or 0 for r in valid_results], 'SINR', 'dB')
 
-    # ROW 3: CPU Stack & Table
     ax7 = fig.add_subplot(gs[2, :2])
     if not df_cpu.empty:
         df_cpu.plot(kind='bar', stacked=True, ax=ax7, colormap='tab20', width=0.6)
@@ -404,7 +498,6 @@ def generate_summary_report(all_results, timestamp):
         plt.setp(ax7.xaxis.get_majorticklabels(), rotation=0, fontsize=9)
         ax7.grid(axis='y', alpha=0.3)
 
-    # Parameter Table
     ax9 = fig.add_subplot(gs[2, 2])
     ax9.axis('off')
     table_data = [[r['test_id'], r['oru'], r['isolcpus']] for r in valid_results]
