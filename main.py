@@ -3,7 +3,6 @@ import re
 import pandas as pd
 import seaborn as sns
 import matplotlib.pyplot as plt
-import matplotlib.colors as mcolors
 import numpy as np
 import requests
 from datetime import datetime
@@ -186,7 +185,7 @@ def generate_combined_cpu_plots(all_core_data, bitrates, timestamp):
         print("  No per-core CPU data to plot")
         return
 
-    # Collect all cpu keys across all segments
+    # Collect all cpu keys (cpu0, cpu1, ...) across all segments
     all_cpu_keys = set()
     for data in all_core_data:
         if data and "cpus" in data:
@@ -194,28 +193,26 @@ def generate_combined_cpu_plots(all_core_data, bitrates, timestamp):
                 if re.match(r"^cpu\d+$", k):
                     all_cpu_keys.add(k)
     cpu_keys = _sort_cpu_keys(list(all_cpu_keys))
+    n_cores = len(cpu_keys)
 
     # Build concatenated timeseries per core
-    # elapsed_time resets at start of each bitrate segment, we offset them
-    combined_timestamps = []   # global elapsed seconds
+    combined_timestamps = []
     combined_percent = {k: [] for k in cpu_keys}
-    bitrate_boundaries = []    # x positions of bitrate switches (in seconds)
-
+    bitrate_boundaries = []
     current_offset = 0.0
 
     for seg_idx, (data, bitrate) in enumerate(zip(all_core_data, bitrates)):
         if data is None or "cpus" not in data:
-            # Fill with zeros for missing segment
-            segment_len = PERF_DURATION
-            seg_times = [current_offset + i for i in range(segment_len)]
-            combined_timestamps.extend(seg_times)
+            seg_times_raw = list(range(PERF_DURATION))
+            combined_timestamps.extend([current_offset + t for t in seg_times_raw])
             for k in cpu_keys:
-                combined_percent[k].extend([0.0] * segment_len)
-            current_offset += segment_len
-            bitrate_boundaries.append(current_offset)
+                combined_percent[k].extend([0.0] * len(seg_times_raw))
+            current_offset += PERF_DURATION
+            if seg_idx < len(bitrates) - 1:
+                bitrate_boundaries.append(current_offset)
             continue
 
-        # Get timestamps from any available core
+        # Get timestamps from first available core
         seg_times_raw = None
         for k in cpu_keys:
             cpu_entry = data["cpus"].get(k)
@@ -225,7 +222,6 @@ def generate_combined_cpu_plots(all_core_data, bitrates, timestamp):
                     t0 = ts_data["timestamps"][0]
                     seg_times_raw = [t - t0 for t in ts_data["timestamps"]]
                     break
-
         if seg_times_raw is None:
             seg_times_raw = list(range(PERF_DURATION))
 
@@ -238,7 +234,6 @@ def generate_combined_cpu_plots(all_core_data, bitrates, timestamp):
                 ts_data = cpu_entry["usage"].get("timeseries")
                 if ts_data and "percent" in ts_data:
                     pct = ts_data["percent"]
-                    # Pad or trim to match seg_times_raw length
                     n = len(seg_times_raw)
                     if len(pct) < n:
                         pct = pct + [0.0] * (n - len(pct))
@@ -252,39 +247,59 @@ def generate_combined_cpu_plots(all_core_data, bitrates, timestamp):
         if seg_idx < len(bitrates) - 1:
             bitrate_boundaries.append(current_offset)
 
-    # ------------------------------------------------------------------ #
-    # Plot 1: CPU Core Heatmap (time x core, color = usage %)
-    # ------------------------------------------------------------------ #
-    # Build 2D matrix: rows=cores, cols=time samples
-    matrix = np.array([combined_percent[k] for k in cpu_keys])  # shape: (n_cores, n_time)
-
-    fig, ax = plt.subplots(figsize=(max(14, len(combined_timestamps) * 0.15), max(8, len(cpu_keys) * 0.4)))
-    im = ax.imshow(matrix, aspect='auto', cmap='YlOrRd', vmin=0, vmax=100,
-                   extent=[combined_timestamps[0], combined_timestamps[-1],
-                            len(cpu_keys) - 0.5, -0.5])
-    plt.colorbar(im, ax=ax, label='Usage (%)')
-
-    # Y axis: cpu labels
-    ax.set_yticks(range(len(cpu_keys)))
-    ax.set_yticklabels(cpu_keys, fontsize=8)
-
-    # Bitrate boundary lines and labels
-    for boundary in bitrate_boundaries:
-        ax.axvline(x=boundary, color='white', linewidth=1.5, linestyle='--', alpha=0.8)
-
-    # Bitrate labels in middle of each segment
+    # Segment midpoints for labels
     segment_starts = [0.0] + bitrate_boundaries
     segment_ends = bitrate_boundaries + [combined_timestamps[-1]]
+
+    # Dynamic vmax based on actual data
+    all_values = [v for k in cpu_keys for v in combined_percent[k] if v is not None]
+    data_max = max(all_values) if all_values else 100.0
+    vmax = max(data_max * 1.1, 10.0)
+
+    # ------------------------------------------------------------------ #
+    # Plot 1: CPU Core Heatmap (cores x time, color = usage %)
+    # ------------------------------------------------------------------ #
+    matrix = np.array([combined_percent[k] for k in cpu_keys])  # (n_cores, n_time)
+
+    # Extract core numbers for Y axis
+    core_numbers = [int(re.match(r"cpu(\d+)", k).group(1)) for k in cpu_keys]
+
+    fig_h = max(6, n_cores * 0.3)
+    fig_w = max(12, len(combined_timestamps) * 0.5)
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+
+    im = ax.imshow(
+        matrix,
+        aspect='auto',
+        cmap='YlOrRd',
+        vmin=0,
+        vmax=vmax,
+        extent=[combined_timestamps[0], combined_timestamps[-1],
+                n_cores - 0.5, -0.5],
+        interpolation='nearest',
+    )
+    cbar = plt.colorbar(im, ax=ax)
+    cbar.set_label('Usage (%)', fontsize=10)
+
+    # Y axis: numeric core numbers
+    ax.set_yticks(range(n_cores))
+    ax.set_yticklabels(core_numbers, fontsize=8)
+
+    # Bitrate boundary lines
+    for boundary in bitrate_boundaries:
+        ax.axvline(x=boundary, color='white', linewidth=2, linestyle='--', alpha=0.9)
+
+    # Bitrate labels at top of chart
     for i, bitrate in enumerate(bitrates):
         mid = (segment_starts[i] + segment_ends[i]) / 2
-        ax.text(mid, len(cpu_keys) * 0.05, f'{bitrate}M',
-                ha='center', va='top', fontsize=10, fontweight='bold',
-                color='white',
-                bbox=dict(boxstyle='round,pad=0.3', facecolor='black', alpha=0.5))
+        ax.text(mid, -1.2, f'{bitrate}M',
+                ha='center', va='bottom', fontsize=11, fontweight='bold',
+                transform=ax.get_xaxis_transform())
 
-    ax.set_title(f'CPU Heatmap - {" / ".join(str(b) + "M" for b in bitrates)} Mbps\n{timestamp}')
-    ax.set_xlabel('Time (seconds)')
-    ax.set_ylabel('CPU Core')
+    ax.set_title(f'CPU Heatmap - {" / ".join(str(b) + "M" for b in bitrates)} Mbps\n{timestamp}',
+                 fontsize=12)
+    ax.set_xlabel('Time (seconds)', fontsize=10)
+    ax.set_ylabel('CPU Core', fontsize=10)
     plt.tight_layout()
     heatmap_file = f'cpu_core_heatmap_combined_{timestamp}.png'
     plt.savefig(heatmap_file, dpi=150)
@@ -292,37 +307,36 @@ def generate_combined_cpu_plots(all_core_data, bitrates, timestamp):
     plt.close()
 
     # ------------------------------------------------------------------ #
-    # Plot 2: CPU Core Timeseries (active cores only)
+    # Plot 2: CPU Core Timeseries (active cores > avg 1%)
     # ------------------------------------------------------------------ #
-    # Only plot cores with avg > 1% across all segments
     active_cores = [k for k in cpu_keys
                     if np.mean([v for v in combined_percent[k] if v is not None]) > 1.0]
     if not active_cores:
         active_cores = cpu_keys
 
     fig, ax = plt.subplots(figsize=(14, 6))
-    cmap = plt.get_cmap("tab20")
+    cmap_ts = plt.get_cmap("tab20")
     for i, cpu_key in enumerate(active_cores):
+        core_num = re.match(r"cpu(\d+)", cpu_key).group(1)
         ax.plot(combined_timestamps, combined_percent[cpu_key],
-                label=cpu_key, color=cmap(i % 20), linewidth=1.5)
+                label=f'cpu{core_num}', color=cmap_ts(i % 20), linewidth=1.5)
 
     # Bitrate boundary lines
     for boundary in bitrate_boundaries:
-        ax.axvline(x=boundary, color='gray', linewidth=1, linestyle='--', alpha=0.7)
+        ax.axvline(x=boundary, color='gray', linewidth=1.2, linestyle='--', alpha=0.7)
 
     # Bitrate labels
     for i, bitrate in enumerate(bitrates):
         mid = (segment_starts[i] + segment_ends[i]) / 2
-        ax.text(mid, 102, f'{bitrate}M', ha='center', va='bottom',
-                fontsize=9, fontweight='bold',
+        ax.text(mid, vmax * 1.02, f'{bitrate}M',
+                ha='center', va='bottom', fontsize=9, fontweight='bold',
                 bbox=dict(boxstyle='round,pad=0.2', facecolor='lightyellow', alpha=0.8))
 
-    ax.set_title(f'CPU Core Usage - {" / ".join(str(b) + "M" for b in bitrates)} Mbps\n{timestamp}\nActive Cores (>1%)')
-    ax.set_xlabel('Time (seconds)')
-    ax.set_ylabel('CPU Usage (%)')
-    ax.set_ylim(0, 110)
-    ax.legend(loc='upper right', fontsize=8, ncol=4,
-              title='Active Cores (>1%)')
+    ax.set_title(f'CPU Core Usage - {" / ".join(str(b) + "M" for b in bitrates)} Mbps\n{timestamp}')
+    ax.set_xlabel('Time (seconds)', fontsize=10)
+    ax.set_ylabel('CPU Usage (%)', fontsize=10)
+    ax.set_ylim(0, vmax * 1.15)
+    ax.legend(loc='upper right', fontsize=8, ncol=4, title='Active Cores (>1%)')
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
     timeseries_file = f'cpu_core_timeseries_combined_{timestamp}.png'
